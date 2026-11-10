@@ -1,0 +1,13 @@
+{
+  "name": "color-camera",
+  "version": "1.0.0",
+  "description": "Color Camera MVP: button -> phone photo -> locked gallery -> explore by color",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "ws": "^8.18.0"
+  }
+}

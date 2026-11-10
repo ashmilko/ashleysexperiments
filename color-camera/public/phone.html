@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Color Camera - Phone</title>
+<style>
+  body { margin: 0; background: #111; color: #eee; font-family: system-ui, sans-serif; text-align: center; }
+  #banner { padding: 14px; font-size: 20px; font-weight: bold; }
+  .ok { background: #1b7a3a; }
+  .bad { background: #c62828; }
+  .busy { background: #b26a00; }
+  video { width: 100%; max-height: 60vh; background: #000; display: block; }
+  #flash { position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none; transition: opacity 0.3s; }
+  button, label.btn { display: inline-block; margin: 10px 6px; padding: 16px 26px; font-size: 20px; border: 0; border-radius: 12px; cursor: pointer; }
+  #snapBtn { background: #fff; color: #000; }
+  label.btn { background: #444; color: #fff; }
+  #log { font-size: 15px; opacity: 0.8; padding: 0 10px; }
+</style>
+</head>
+<body>
+<div id="banner" class="busy">Starting...</div>
+<video id="video" autoplay playsinline muted></video>
+<div>
+  <button id="snapBtn">SNAP</button>
+  <label class="btn">Native camera
+    <input id="fileInput" type="file" accept="image/*" capture="environment" hidden>
+  </label>
+</div>
+<div id="log">Keep this page open with the screen on.</div>
+<div id="flash"></div>
+<canvas id="canvas" hidden></canvas>
+
+<script>
+const MAX_SIZE = 1600; // longest side of the uploaded photo, in pixels
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const banner = document.getElementById("banner");
+const log = document.getElementById("log");
+
+let socket = null;
+let cameraOk = false;
+let cameraProblem = "";
+let uploading = false;
+
+function updateBanner() {
+  if (!socket || socket.readyState !== 1) {
+    setBanner("bad", "SERVER OFFLINE - reconnecting...");
+  } else if (uploading) {
+    setBanner("busy", "Uploading photo...");
+  } else if (!cameraOk) {
+    setBanner("bad", "CAMERA BLOCKED: " + cameraProblem);
+  } else {
+    setBanner("ok", "Ready - waiting for button press");
+  }
+}
+function setBanner(cls, text) {
+  banner.className = cls;
+  banner.textContent = text;
+}
+
+// ---------- WebSocket (auto-reconnects) ----------
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  socket = new WebSocket(proto + "://" + location.host);
+  socket.onopen = () => {
+    socket.send(JSON.stringify({ type: "hello", role: "phone" }));
+    updateBanner();
+  };
+  socket.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === "snap") takePhoto();
+  };
+  socket.onclose = () => {
+    updateBanner();
+    setTimeout(connect, 1500);
+  };
+}
+
+function reportError(message) {
+  log.textContent = message;
+  if (socket && socket.readyState === 1) socket.send(JSON.stringify({ type: "cameraError", message }));
+}
+
+// ---------- Camera ----------
+async function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    cameraProblem = "this page needs https (use the ngrok/cloudflared link) or use Native camera below";
+    updateBanner();
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+    cameraOk = true;
+  } catch (err) {
+    cameraProblem = err.name + " - allow camera access, close other apps using it, then reload";
+  }
+  updateBanner();
+}
+
+// Draw any image source onto the canvas (scaled down) and return a JPEG blob
+function toJpeg(source, w, h) {
+  const scale = Math.min(1, MAX_SIZE / Math.max(w, h));
+  canvas.width = Math.round(w * scale);
+  canvas.height = Math.round(h * scale);
+  canvas.getContext("2d").drawImage(source, 0, 0, canvas.width, canvas.height);
+  return new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.85));
+}
+
+async function takePhoto() {
+  if (!cameraOk || !video.videoWidth) {
+    reportError("Snap received but the camera is not ready. Use the Native camera button.");
+    return;
+  }
+  flash();
+  const blob = await toJpeg(video, video.videoWidth, video.videoHeight);
+  upload(blob);
+}
+
+async function upload(blob) {
+  uploading = true;
+  updateBanner();
+  try {
+    const res = await fetch("/upload", { method: "POST", headers: { "Content-Type": "image/jpeg" }, body: blob });
+    if (!res.ok) throw new Error("server said " + res.status);
+    log.textContent = "Uploaded at " + new Date().toLocaleTimeString() + " (" + Math.round(blob.size / 1024) + " KB)";
+  } catch (err) {
+    reportError("Upload failed: " + err.message);
+  }
+  uploading = false;
+  updateBanner();
+}
+
+function flash() {
+  const f = document.getElementById("flash");
+  f.style.transition = "none";
+  f.style.opacity = 1;
+  requestAnimationFrame(() => { f.style.transition = "opacity 0.4s"; f.style.opacity = 0; });
+}
+
+// Fallback: use the phone's own camera app, then upload the picked file
+document.getElementById("fileInput").addEventListener("change", (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const img = new Image();
+  img.onload = async () => {
+    const blob = await toJpeg(img, img.naturalWidth, img.naturalHeight);
+    URL.revokeObjectURL(img.src);
+    upload(blob);
+  };
+  img.onerror = () => reportError("Could not read that photo");
+  img.src = URL.createObjectURL(file);
+  e.target.value = "";
+});
+
+document.getElementById("snapBtn").addEventListener("click", takePhoto);
+
+// Ask the phone not to turn its screen off (works in most modern browsers)
+async function keepAwake() {
+  try { if ("wakeLock" in navigator) await navigator.wakeLock.request("screen"); } catch (e) {}
+}
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") keepAwake(); });
+
+connect();
+startCamera();
+keepAwake();
+</script>
+</body>
+</html>

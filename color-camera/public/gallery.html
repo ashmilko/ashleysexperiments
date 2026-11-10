@@ -1,0 +1,553 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Color Camera - Gallery</title>
+<script src="https://cdn.jsdelivr.net/npm/p5@1.11.11/lib/p5.min.js"></script>
+<script src="https://unpkg.com/@gohai/p5.webserial@1.1.3/libraries/p5.webserial.js"></script>
+<script src="https://unpkg.com/ml5@1.3.1/dist/ml5.min.js"></script>
+<style>
+  body { margin: 0; overflow: hidden; background: #111; font-family: system-ui, sans-serif; }
+  #arduinoBtn { position: fixed; top: 12px; right: 12px; padding: 10px 16px; font-size: 16px;
+                border: 0; border-radius: 8px; cursor: pointer; z-index: 2; }
+  #noP5 { color: #fff; background: #c62828; padding: 30px; font-size: 26px; display: none; }
+</style>
+</head>
+<body>
+<div id="noP5">p5.js did not load. The gallery needs internet for p5 / ml5 (check Wi-Fi), then reload.</div>
+<script>if (typeof p5 === "undefined") document.getElementById("noP5").style.display = "block";</script>
+<script>
+// =====================================================================
+// Settings
+// =====================================================================
+const BAR_H = 70;          // height of the rainbow bar at the bottom
+const HUE_RANGE = 25;      // how close (in degrees of hue) a photo must be to match
+const SNAP_TIMEOUT = 8000; // warn if no photo arrives this long after a snap
+
+// =====================================================================
+// State
+// =====================================================================
+let photos = [];           // {url, revealAt, img, tiny, hue, col, x, y, s}
+let socket;
+let serverOnline = false;
+let cameraPages = 0;       // how many phone.html pages are connected
+let cameraError = "";      // last error message from the phone page
+let cameraErrorAt = 0;
+let snapSentAt = 0;        // 0 = no snap waiting for a photo
+let serverOffset = 0;      // server clock minus our clock
+
+let selectedHue = null;    // null = no color filter
+let viewing = null;        // the photo currently opened full screen
+
+let port = null;           // Arduino (Web Serial)
+let serialSupported = true;
+let arduinoBtn;
+
+let video;                 // laptop webcam for hand tracking
+let handPose = null;
+let hands = [];
+let handStatus = "loading";  // loading | ready | failed
+let pointer = { x: 0, y: 0, fromHand: false };
+let lastMouseMove = -99999;
+let pinching = false;
+
+// =====================================================================
+// p5 setup / draw
+// =====================================================================
+function setup() {
+  createCanvas(windowWidth, windowHeight).mousePressed(() => {
+    // When the hand isn't being tracked, the mouse acts as the hand.
+    // Click = pinch.
+    if (!pointer.fromHand) pinchAction();
+  });
+  textFont("system-ui");
+
+  setupSerial();
+  setupHandTracking();
+  connectToServer();
+}
+
+function draw() {
+  background(17);
+  readSerial();
+  updatePointer();
+  layoutAndDrawPhotos();
+  drawRainbowBar();
+  drawHandPreview();
+  drawPointer();
+  if (viewing) drawViewer();
+  drawWarnings();
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+}
+
+function now() {
+  return Date.now() + serverOffset;
+}
+
+// =====================================================================
+// Server connection (WebSocket + photo list)
+// =====================================================================
+function connectToServer() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  socket = new WebSocket(proto + "://" + location.host);
+
+  socket.onopen = () => {
+    serverOnline = true;
+    socket.send(JSON.stringify({ type: "hello", role: "gallery" }));
+    loadPhotoList();
+  };
+  socket.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === "photo") {
+      snapSentAt = 0;
+      addPhoto(msg.photo);
+    } else if (msg.type === "status") {
+      cameraPages = msg.cameras;
+    } else if (msg.type === "cameraError") {
+      cameraError = msg.message;
+      cameraErrorAt = millis();
+      snapSentAt = 0;
+    }
+  };
+  socket.onclose = () => {
+    serverOnline = false;
+    setTimeout(connectToServer, 1500); // keep trying until the server is back
+  };
+}
+
+async function loadPhotoList() {
+  try {
+    const res = await fetch("/photos");
+    const data = await res.json();
+    serverOffset = data.now - Date.now();
+    data.photos.forEach(addPhoto);
+  } catch (err) {
+    console.log("Could not load photo list", err);
+  }
+}
+
+function addPhoto(info) {
+  if (photos.some((p) => p.url === info.url)) return; // already have it
+  const p = { url: info.url, revealAt: info.revealAt, img: null, tiny: null,
+              hue: null, col: null, x: width / 2, y: height / 2, s: 0 };
+  photos.push(p);
+  loadImage(info.url, (img) => {
+    p.img = img;
+    p.tiny = makeBlurred(img);
+    extractColor(p);
+  });
+}
+
+function sendSnap() {
+  if (!serverOnline) return;
+  socket.send(JSON.stringify({ type: "snap" }));
+  snapSentAt = millis();
+}
+
+function isLocked(p) {
+  return now() < p.revealAt;
+}
+
+// =====================================================================
+// Image processing: blur + brightest color
+// =====================================================================
+
+// "Blur" = shrink the photo to 12 pixels wide. When drawn big again,
+// the browser smooths it out, which looks like a strong blur.
+function makeBlurred(img) {
+  const t = img.get();
+  t.resize(12, 0);
+  return t;
+}
+
+// Find the photo's brightest, most colorful color:
+// score each pixel by saturation x brightness, then average the top 10%.
+function extractColor(p) {
+  const t = p.img.get();
+  t.resize(60, 0);
+  t.loadPixels();
+  const list = [];
+  for (let i = 0; i < t.pixels.length; i += 4) {
+    const r = t.pixels[i], g = t.pixels[i + 1], b = t.pixels[i + 2];
+    const mx = max(r, g, b), mn = min(r, g, b);
+    const sat = mx === 0 ? 0 : (mx - mn) / mx;
+    list.push({ r, g, b, score: sat * (mx / 255) });
+  }
+  list.sort((a, b) => b.score - a.score);
+  const top = list.slice(0, max(1, floor(list.length * 0.1)));
+  let r = 0, g = 0, b = 0;
+  for (const c of top) { r += c.r; g += c.g; b += c.b; }
+  r /= top.length; g /= top.length; b /= top.length;
+
+  p.col = color(r, g, b);
+  colorMode(HSB, 360, 100, 100);
+  // A black & white photo has no real hue, so it matches no color.
+  p.hue = saturation(p.col) < 15 ? null : hue(p.col);
+  colorMode(RGB, 255);
+}
+
+function hueDistance(a, b) {
+  const d = abs(a - b) % 360;
+  return d > 180 ? 360 - d : d;
+}
+
+function matchesFilter(p) {
+  return selectedHue !== null && p.hue !== null && !isLocked(p) &&
+         hueDistance(p.hue, selectedHue) < HUE_RANGE;
+}
+
+// =====================================================================
+// Drawing the photo grid
+// =====================================================================
+function layoutAndDrawPhotos() {
+  const areaTop = 120, areaBottom = height - BAR_H - 20;
+  const areaW = width - 40, areaH = areaBottom - areaTop;
+
+  // Pick the biggest tile size that still fits every photo on screen
+  let size = 220, cols = 1;
+  while (size > 40) {
+    cols = max(1, floor(areaW / size));
+    if (ceil(photos.length / cols) * size <= areaH) break;
+    size -= 10;
+  }
+  const gridW = min(photos.length, cols) * size;
+  const left = (width - gridW) / 2;
+
+  if (photos.length === 0) {
+    fill(160); noStroke(); textAlign(CENTER, CENTER); textSize(26);
+    text("No photos yet. Press the button (or SPACE) to take one.", width / 2, height / 2 - 40);
+  }
+
+  // Work out where each photo wants to be, then glide towards it
+  photos.forEach((p, i) => {
+    let tx = left + (i % cols) * size + size / 2;
+    let ty = areaTop + floor(i / cols) * size + size / 2;
+    let ts = size - 12;
+    if (matchesFilter(p)) {
+      // Matching photos grow and drift towards the hand
+      tx = lerp(tx, pointer.x, 0.45);
+      ty = lerp(ty, pointer.y, 0.45);
+      ts *= 1.5;
+    }
+    p.x = lerp(p.x, tx, 0.12);
+    p.y = lerp(p.y, ty, 0.12);
+    p.s = lerp(p.s, ts, 0.15);
+  });
+
+  // Draw matching photos last so they sit on top
+  const ordered = photos.filter((p) => !matchesFilter(p)).concat(photos.filter(matchesFilter));
+  for (const p of ordered) drawTile(p);
+}
+
+function drawTile(p) {
+  const s = p.s, x = p.x - s / 2, y = p.y - s / 2;
+  const dim = selectedHue !== null && !matchesFilter(p);
+
+  if (!p.img) {
+    fill(40); noStroke(); rect(x, y, s, s, 8);
+    fill(150); textAlign(CENTER, CENTER); textSize(14);
+    text("loading...", p.x, p.y);
+    return;
+  }
+
+  push();
+  if (dim) tint(255, 70);
+  if (isLocked(p)) {
+    drawCropped(p.tiny, x, y, s);
+    noTint();
+    fill(0, 120); noStroke(); rect(x, y, s, s);
+    drawLock(p.x, p.y - s * 0.08, s * 0.18);
+    const secs = ceil((p.revealAt - now()) / 1000);
+    fill(255); textAlign(CENTER, CENTER); textSize(max(12, s * 0.12));
+    text("0:" + nf(secs, 2), p.x, p.y + s * 0.22);
+  } else {
+    drawCropped(p.img, x, y, s);
+    noFill(); strokeWeight(6);
+    stroke(dim ? color(red(p.col), green(p.col), blue(p.col), 70) : p.col);
+    rect(x + 3, y + 3, s - 6, s - 6, 4);
+  }
+  pop();
+}
+
+// Draw the centre square of an image
+function drawCropped(img, x, y, s) {
+  const side = min(img.width, img.height);
+  image(img, x, y, s, s, (img.width - side) / 2, (img.height - side) / 2, side, side);
+}
+
+function drawLock(cx, cy, r) {
+  noFill(); stroke(255); strokeWeight(max(2, r * 0.18));
+  arc(cx, cy - r * 0.3, r, r * 1.1, PI, 0);
+  noStroke(); fill(255);
+  rect(cx - r * 0.7, cy - r * 0.3, r * 1.4, r * 1.1, 3);
+}
+
+// =====================================================================
+// Rainbow color bar
+// =====================================================================
+function drawRainbowBar() {
+  const y = height - BAR_H;
+  colorMode(HSB, 360, 100, 100);
+  noStroke();
+  for (let x = 0; x < width; x += 4) {
+    fill((x / width) * 360, 80, 95);
+    rect(x, y, 4, BAR_H);
+  }
+  colorMode(RGB, 255);
+
+  // One dot per unlocked photo, at its color's position
+  const counts = {};
+  for (const p of photos) {
+    if (!p.img || p.hue === null || isLocked(p)) continue;
+    const dx = round((p.hue / 360) * width);
+    const bucket = round(dx / 14);
+    counts[bucket] = (counts[bucket] || 0) + 1;
+    stroke(0); strokeWeight(2); fill(p.col);
+    circle(dx, y + BAR_H - 14 - (counts[bucket] - 1) * 14, 14);
+  }
+
+  // Selected color marker
+  if (selectedHue !== null) {
+    const sx = (selectedHue / 360) * width;
+    stroke(255); strokeWeight(4); noFill();
+    rect(sx - 8, y + 2, 16, BAR_H - 4, 4);
+  }
+
+  noStroke(); fill(0, 160); rect(0, y - 24, width, 24);
+  fill(255); textSize(14); textAlign(LEFT, CENTER);
+  const label = selectedHue === null ? "no color picked" : "color picked: " + round(selectedHue) + "°";
+  text("Hover the rainbow to pick a color (" + label + ")   SPACE snap · R reveal all · C clear color · click/pinch opens a photo",
+       10, y - 12);
+}
+
+// =====================================================================
+// Hand tracking (ml5 handPose) with mouse fallback
+// =====================================================================
+function setupHandTracking() {
+  video = createCapture(VIDEO, { flipped: true });
+  video.size(640, 480);
+  video.hide();
+
+  if (typeof ml5 === "undefined") {
+    handStatus = "failed";
+    return;
+  }
+  try {
+    handPose = ml5.handPose({ flipped: true, maxHands: 1 }, () => {
+      // ml5 calls this even if the model failed to download (no internet),
+      // so check the model really exists before starting detection.
+      if (!handPose.model) {
+        handStatus = "failed";
+        return;
+      }
+      handStatus = "ready";
+      handPose.detectStart(video, (results) => (hands = results));
+    });
+  } catch (err) {
+    console.log("handPose failed", err);
+    handStatus = "failed";
+  }
+}
+
+function mouseMoved() {
+  lastMouseMove = millis();
+}
+
+function updatePointer() {
+  const hand = hands[0];
+  const mouseRecent = millis() - lastMouseMove < 2000;
+
+  if (hand && !mouseRecent && video.width > 0) {
+    // Index fingertip is the pointer (video coords -> screen coords)
+    const tip = hand.index_finger_tip;
+    pointer.x = lerp(pointer.x, (tip.x / video.width) * width, 0.4);
+    pointer.y = lerp(pointer.y, (tip.y / video.height) * height, 0.4);
+    pointer.fromHand = true;
+
+    // Pinch = thumb tip close to index tip (relative to hand size)
+    const handSize = dist(hand.wrist.x, hand.wrist.y, hand.middle_finger_mcp.x, hand.middle_finger_mcp.y);
+    const gap = dist(tip.x, tip.y, hand.thumb_tip.x, hand.thumb_tip.y) / handSize;
+    if (!pinching && gap < 0.3) {
+      pinching = true;
+      pinchAction();
+    } else if (pinching && gap > 0.5) {
+      pinching = false;
+    }
+  } else {
+    pointer.x = mouseX;
+    pointer.y = mouseY;
+    pointer.fromHand = false;
+    pinching = false;
+  }
+
+  // Hovering the rainbow bar picks a color
+  if (pointer.y > height - BAR_H && !viewing) {
+    selectedHue = constrain((pointer.x / width) * 360, 0, 359);
+  }
+}
+
+function pinchAction() {
+  if (viewing) {
+    viewing = null; // pinch/click again closes the photo
+    return;
+  }
+  // Open the photo under the pointer (top-most first)
+  for (let i = photos.length - 1; i >= 0; i--) {
+    const p = photos[i];
+    if (matchesFilter(p) && abs(pointer.x - p.x) < p.s / 2 && abs(pointer.y - p.y) < p.s / 2) {
+      viewing = p;
+      return;
+    }
+  }
+  for (let i = photos.length - 1; i >= 0; i--) {
+    const p = photos[i];
+    if (p.img && abs(pointer.x - p.x) < p.s / 2 && abs(pointer.y - p.y) < p.s / 2) {
+      viewing = p;
+      return;
+    }
+  }
+}
+
+function drawPointer() {
+  noFill(); strokeWeight(3);
+  stroke(pointer.fromHand ? color(0, 255, 180) : color(255));
+  circle(pointer.x, pointer.y, pinching ? 18 : 34);
+}
+
+function drawHandPreview() {
+  if (!video || video.width === 0) return;
+  const w = 160, h = 120, x = width - w - 10, y = height - BAR_H - 24 - h - 10;
+  image(video, x, y, w, h);
+  if (hands[0]) {
+    noStroke(); fill(0, 255, 180);
+    for (const k of hands[0].keypoints) circle(x + (k.x / video.width) * w, y + (k.y / video.height) * h, 4);
+  }
+  noFill(); stroke(255, 120); strokeWeight(1); rect(x, y, w, h);
+}
+
+// =====================================================================
+// Full-screen photo viewer
+// =====================================================================
+function drawViewer() {
+  const p = viewing;
+  fill(0, 230); noStroke(); rect(0, 0, width, height);
+  const maxW = width * 0.85, maxH = height * 0.8;
+  const sc = min(maxW / p.img.width, maxH / p.img.height);
+  const w = p.img.width * sc, h = p.img.height * sc;
+  const locked = isLocked(p);
+  image(locked ? p.tiny : p.img, (width - w) / 2, (height - h) / 2, w, h);
+  fill(255); textAlign(CENTER, CENTER); textSize(20);
+  text(locked ? "Still locked - unlocks in " + ceil((p.revealAt - now()) / 1000) + "s"
+              : "Pinch or click to close", width / 2, height - 30);
+  if (!locked && p.col) {
+    noFill(); stroke(p.col); strokeWeight(10);
+    rect((width - w) / 2, (height - h) / 2, w, h);
+  }
+}
+
+// =====================================================================
+// Arduino (Web Serial via @gohai/p5.webserial)
+// =====================================================================
+function setupSerial() {
+  arduinoBtn = createButton("Connect Arduino");
+  arduinoBtn.id("arduinoBtn");
+  try {
+    port = createSerial(); // throws if the browser has no Web Serial (Safari, Firefox)
+  } catch (err) {
+    serialSupported = false;
+    arduinoBtn.html("Arduino needs Chrome/Edge");
+    return;
+  }
+  arduinoBtn.mousePressed(() => {
+    if (port.opened()) port.close();
+    else port.open(9600); // no filter, so clone boards (CH340 chips) show up too
+  });
+  // If this page was allowed to use the Arduino before, reconnect automatically
+  setTimeout(() => {
+    const used = usedSerialPorts();
+    if (used.length > 0 && !port.opened()) port.open(used[0], 9600);
+  }, 800);
+}
+
+function readSerial() {
+  if (!port) return;
+  arduinoBtn.html(port.opened() ? "Arduino connected ✓ (click to disconnect)" : "Connect Arduino");
+  arduinoBtn.style("background", port.opened() ? "#1b7a3a" : "#ffb300");
+  arduinoBtn.style("color", port.opened() ? "#fff" : "#000");
+  if (!port.opened()) return;
+
+  // Read complete lines like "SNAP" or "P,512"
+  while (port.available() > 0) {
+    const line = port.readUntil("\n");
+    if (line === "") break; // only half a line has arrived so far
+    const msg = line.trim();
+    if (msg === "SNAP") {
+      sendSnap();
+    } else if (msg.startsWith("P,")) {
+      const value = int(msg.slice(2));
+      if (!isNaN(value)) selectedHue = map(value, 0, 1023, 0, 359);
+    }
+  }
+}
+
+// =====================================================================
+// Keyboard shortcuts (demo safety net)
+// =====================================================================
+function keyPressed() {
+  if (key === " ") {
+    sendSnap();
+    return false; // stop the page from scrolling
+  }
+  if (key === "r" || key === "R") {
+    for (const p of photos) p.revealAt = 0;
+  }
+  if (key === "c" || key === "C") {
+    selectedHue = null;
+  }
+  if (keyCode === ESCAPE) viewing = null;
+}
+
+// =====================================================================
+// Big on-screen warnings, so problems are obvious during the demo
+// =====================================================================
+function drawWarnings() {
+  const red = [];
+  const amber = [];
+
+  if (!serverOnline) red.push("SERVER OFFLINE - run  node server.js  (reconnecting...)");
+  else if (cameraPages === 0) red.push("NO CAMERA - open /phone.html on the phone or laptop");
+  if (cameraError && millis() - cameraErrorAt < 10000) red.push("CAMERA PROBLEM: " + cameraError);
+  if (snapSentAt && millis() - snapSentAt > SNAP_TIMEOUT) red.push("Snap sent but no photo arrived - check the phone page");
+
+  if (!serialSupported) amber.push("Arduino needs Chrome or Edge (SPACE still works)");
+  else if (port && !port.opened()) amber.push("Arduino not connected - click Connect Arduino (SPACE still works)");
+  if (handStatus === "failed") amber.push("Hand tracking unavailable - use the mouse");
+  else if (handStatus === "loading") amber.push("Loading hand tracking... (mouse works meanwhile)");
+  if (video && video.width === 0 && millis() > 5000) amber.push("Webcam blocked for hand tracking - use the mouse");
+
+  let y = 12;
+  textAlign(LEFT, CENTER);
+  for (const msg of red) y = drawBanner(msg, y, color(198, 40, 40), 255, 22);
+  for (const msg of amber) y = drawBanner(msg, y, color(255, 179, 0, 220), 0, 15);
+
+  // Short "snap!" feedback
+  if (snapSentAt && millis() - snapSentAt < SNAP_TIMEOUT) {
+    fill(255); noStroke(); textAlign(CENTER, CENTER); textSize(28);
+    text("📸 Taking photo...", width / 2, height - BAR_H - 60);
+  }
+}
+
+function drawBanner(msg, y, bg, textColor, size) {
+  textSize(size);
+  const w = textWidth(msg) + 24, h = size + 14;
+  noStroke(); fill(bg); rect(12, y, w, h, 6);
+  fill(textColor);
+  text(msg, 24, y + h / 2);
+  return y + h + 6;
+}
+</script>
+</body>
+</html>
