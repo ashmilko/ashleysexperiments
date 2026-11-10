@@ -41,6 +41,7 @@ let viewing = null;        // the photo currently opened full screen
 
 let port = null;           // Arduino (Web Serial)
 let serialSupported = true;
+let lastPot = -1000;         // last knob value we used
 let arduinoBtn;
 
 let video;                 // laptop webcam for hand tracking
@@ -487,8 +488,13 @@ function readSerial() {
     if (msg === "SNAP") {
       sendSnap();
     } else if (msg.startsWith("P,")) {
+      // Only react to real knob turns, so tiny electrical noise doesn't
+      // keep changing the color (or undo pressing C)
       const value = int(msg.slice(2));
-      if (!isNaN(value)) selectedHue = map(value, 0, 1023, 0, 359);
+      if (!isNaN(value) && abs(value - lastPot) > 20) {
+        lastPot = value;
+        selectedHue = map(value, 0, 1023, 0, 359);
+      }
     }
   }
 }
@@ -523,7 +529,7 @@ function drawWarnings() {
   if (snapSentAt && millis() - snapSentAt > SNAP_TIMEOUT) red.push("Snap sent but no photo arrived - check the phone page");
 
   if (!serialSupported) amber.push("Arduino needs Chrome or Edge (SPACE still works)");
-  else if (port && !port.opened()) amber.push("Arduino not connected - click Connect Arduino (SPACE still works)");
+  else if (port && !port.opened()) amber.push("Arduino not connected - click Connect Arduino, close the Arduino IDE Serial Monitor (SPACE still works)");
   if (handStatus === "failed") amber.push("Hand tracking unavailable - use the mouse");
   else if (handStatus === "loading") amber.push("Loading hand tracking... (mouse works meanwhile)");
   if (video && video.width === 0 && millis() > 5000) amber.push("Webcam blocked for hand tracking - use the mouse");
