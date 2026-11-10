@@ -100,3 +100,18 @@ void loop() {
 
 ## Style
 Keep it simple and in plain files (no build tools, no frameworks). Don't over-engineer. Prefer small fixes that I can understand and explain in my presentation.
+
+## Current status (updated after the first working session)
+The code in this folder was rebuilt from these notes and the laptop-only flow works on the student's Mac.
+Some notes above are now out of date. What is true now:
+- **Done and tested:** SPACE -> photo -> blurred locked tile with countdown -> unlocks at 20s -> color border + dot on the rainbow bar. Rainbow hover filter, click to open, R / C / ESC keys, red/yellow on-screen warnings, auto-reconnect when the server restarts.
+- **Libraries are local**, in `public/libs/` (p5 1.11.11, ml5 1.3.1, @gohai/p5.webserial 1.1.3). The gallery no longer needs CDNs. Only the ml5 hand model downloads from the internet.
+- **Photos survive a server restart** (server.js rebuilds the list from uploads/ using file times).
+- **Upload limit raised to 25 MB**; the phone also scales photos to max 1600 px before uploading.
+- **Arduino:** tested with a simulated serial port (SNAP split across chunks, P,<value> lines). `port.open(9600)` is called with no preset so clone boards (CH340) show up. Knob changes under 20 are ignored (stops a floating A0 from jittering the color). Not yet tested on the real board.
+- **Hand tracking:** if the model fails to download, ml5 still calls the ready callback with `handPose.model === null`; the gallery checks for that and falls back to the mouse. Not yet tested with a real hand.
+
+## Next steps
+3. Test the real Arduino button (Connect Arduino button, Serial Monitor closed).
+4. Real phone over an https tunnel (`cloudflared tunnel --url http://localhost:3000`, open `<https-url>/phone.html`).
+5. Real hand tracking with internet; tune pinch threshold (`gap < 0.3`) and pointer mapping if needed.
