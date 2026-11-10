@@ -31,3 +31,6 @@ If live camera fails, the **Native camera** button on the phone uses the normal 
 ## On-screen warnings
 - Red = demo is broken (server offline, no camera page open, camera error, snap got no photo).
 - Yellow = optional part missing (Arduino, hand tracking). SPACE and the mouse still work.
+
+The p5, ml5 and serial libraries are inside `public/libs/`, so the page works without internet.
+Only hand tracking needs internet (it downloads its model the first time).
